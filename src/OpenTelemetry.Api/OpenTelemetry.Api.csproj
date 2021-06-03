@@ -13,4 +13,9 @@
     <PackageReference Include="System.Reflection.Emit.Lightweight" Version="$(SystemReflectionEmitLightweightPkgVer)" />
   </ItemGroup>
 
+  <ItemGroup>
+    <PackageReference Include="Microsoft.DotNet.ApiCompat" Version="6.0.0-beta.21277.1" PrivateAssets="All" />
+    <ResolvedMatchingContract Include=".\LastMajorVersionBinary\$(TargetFramework)\$(AssemblyName).dll" />
+  </ItemGroup>
+
 </Project>
