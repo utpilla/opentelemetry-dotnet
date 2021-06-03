@@ -17,5 +17,9 @@
     <PackageReference Include="Microsoft.DotNet.ApiCompat" Version="6.0.0-beta.21277.1" PrivateAssets="All" />
     <ResolvedMatchingContract Include=".\LastMajorVersionBinary\$(TargetFramework)\$(AssemblyName).dll" />
   </ItemGroup>
+  
+<PropertyGroup>
+  <ContractDependencyPaths>C:\Users\utpilla.REDMOND\.nuget\packages\netstandard.library\2.0.3\build\netstandard2.0\ref\;C:\Users\utpilla.REDMOND\.nuget\packages\system.buffers\4.5.1\ref\netstandard2.0\;C:\Users\utpilla.REDMOND\.nuget\packages\system.diagnostics.diagnosticsource\5.0.1\lib\netstandard1.3\;C:\Users\utpilla.REDMOND\.nuget\packages\system.memory\4.5.4\lib\netstandard2.0\;C:\Users\utpilla.REDMOND\.nuget\packages\system.numerics.vectors\4.4.0\ref\netstandard2.0\;C:\Users\utpilla.REDMOND\.nuget\packages\system.reflection.emit.ilgeneration\4.7.0\ref\netstandard2.0\;C:\Users\utpilla.REDMOND\.nuget\packages\system.reflection.emit.lightweight\4.7.0\ref\netstandard2.0\;C:\Users\utpilla.REDMOND\.nuget\packages\system.runtime.compilerservices.unsafe\5.0.0\ref\netstandard2.0\;</ContractDependencyPaths>
+</PropertyGroup>
 
 </Project>
