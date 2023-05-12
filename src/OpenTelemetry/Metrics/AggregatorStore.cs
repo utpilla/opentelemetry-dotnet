@@ -23,6 +23,7 @@ namespace OpenTelemetry.Metrics
     internal sealed class AggregatorStore
     {
         internal readonly bool OutputDelta;
+        internal long DroppedMeasurements = 0;
 
         private static readonly string MetricPointCapHitFixMessage = "Modify instrumentation to reduce the number of unique key/value pair combinations. Or use Views to drop unwanted tags. Or use MeterProviderBuilder.SetMaxMetricPointsPerMetricStream to set higher limit.";
         private static readonly Comparison<KeyValuePair<string, object>> DimensionComparisonDelegate = (x, y) => x.Key.CompareTo(y.Key);
@@ -31,19 +32,20 @@ namespace OpenTelemetry.Metrics
         private readonly HashSet<string> tagKeysInteresting;
         private readonly int tagsKeysInterestingCount;
 
+        // This only applies to Delta AggregationTemporality.
         // This decides when to change the behavior to start reclaiming MetricPoints.
-        // It is set to maxMetricPoints / 2, which means that Snapshot method would start to reclaim MetricPoints
-        // only after half of the MetricPoints have been used.
+        // It is set to maxMetricPoints * 3 / 4, which means that Snapshot method would start to reclaim MetricPoints
+        // only after 75% of the MetricPoints have been used. Once the AggregatorStore starts to reclaim MetricPoints,
+        // it will continue to do so on every Snapshot and it won't go back to its default behavior.
         private readonly int metricPointReclamationThreshold;
 
         // This holds the reclaimed MetricPoints that are available for reuse.
-        private readonly ConcurrentQueue<int> availableMetricPoints = new ConcurrentQueue<int>();
+        private readonly Queue<int> availableMetricPoints;
 
         private readonly ConcurrentDictionary<Tags, int> tagsToMetricPointIndexDictionaryCumulative =
             new();
 
-        private readonly ConcurrentDictionary<Tags, LookupData> tagsToMetricPointIndexDictionaryDelta =
-            new();
+        private readonly ConcurrentDictionary<Tags, LookupData> tagsToMetricPointIndexDictionaryDelta;
 
         private readonly string name;
         private readonly string metricPointCapHitMessage;
@@ -64,7 +66,7 @@ namespace OpenTelemetry.Metrics
         private bool zeroTagMetricPointInitialized;
 
         // When set to true, the behavior changes to reuse MetricPoints
-        private bool reclaimMetricPoints;
+        private bool reclaimMetricPoints = false;
 
         internal AggregatorStore(
             MetricStreamIdentity metricStreamIdentity,
@@ -75,7 +77,18 @@ namespace OpenTelemetry.Metrics
         {
             this.name = metricStreamIdentity.InstrumentName;
             this.maxMetricPoints = maxMetricPoints;
-            this.metricPointReclamationThreshold = maxMetricPoints / 2;
+
+            this.availableMetricPoints = new Queue<int>(maxMetricPoints - 1);
+
+            // There is no overload which only takes capacity as the parameter
+            // Using the DefaultConcurrencyLevel defined in the ConcurrentDictionary class: https://github.com/dotnet/runtime/blob/v7.0.5/src/libraries/System.Collections.Concurrent/src/System/Collections/Concurrent/ConcurrentDictionary.cs#L2020
+            // We expect at the most (maxMetricPoints - 1) * 2 entries- one for sorted and one for unsorted input
+            this.tagsToMetricPointIndexDictionaryDelta =
+                new ConcurrentDictionary<Tags, LookupData>(concurrencyLevel: Environment.ProcessorCount, capacity: (maxMetricPoints - 1) * 2);
+
+            this.metricPointReclamationThreshold = 1;
+
+            // this.metricPointReclamationThreshold = maxMetricPoints * 3 / 4;
             this.metricPointCapHitMessage = $"Maximum MetricPoints limit reached for this Metric stream. Configured limit: {this.maxMetricPoints}";
             this.metricPoints = new MetricPoint[maxMetricPoints];
             this.currentMetricPointBatch = new int[maxMetricPoints];
@@ -215,16 +228,17 @@ namespace OpenTelemetry.Metrics
                 this.batchSize++;
             }
 
-            foreach (var item in this.tagsToMetricPointIndexDictionaryDelta.Values)
+            for (int i = 1; i < this.maxMetricPoints; i++)
             {
-                int i = item.Index;
                 ref var metricPoint = ref this.metricPoints[i];
+
                 if (metricPoint.MetricPointStatus == MetricPointStatus.NoCollectPending)
                 {
+                    // If metricPoint.LookupData is `null` then the MetricPoint is already reclaimed and in the queue.
                     // If the Collect thread is successfully able to compare and swap the reference count from zero to int.MinValue, it means that
                     // the MetricPoint can be reused for other tags.
                     // Index = 0 is reserved for the case where no dimensions are provided.
-                    if (i != 0 && Interlocked.CompareExchange(ref metricPoint.ReferenceCount, int.MinValue, 0) == 0)
+                    if (metricPoint.LookupData != null && Interlocked.CompareExchange(ref metricPoint.ReferenceCount, int.MinValue, 0) == 0)
                     {
                         var lookupData = metricPoint.LookupData;
 
@@ -255,9 +269,9 @@ namespace OpenTelemetry.Metrics
                                     this.tagsToMetricPointIndexDictionaryDelta.TryRemove(lookupData.GivenTags, out var _);
                                 }
                             }
-                        }
 
-                        this.availableMetricPoints.Enqueue(i);
+                            this.availableMetricPoints.Enqueue(i);
+                        }
                     }
 
                     continue;
@@ -502,7 +516,11 @@ namespace OpenTelemetry.Metrics
                                 if (this.reclaimMetricPoints)
                                 {
                                     // Check for an available MetricPoint
-                                    if (!this.availableMetricPoints.TryDequeue(out index))
+                                    if (this.availableMetricPoints.Count > 0)
+                                    {
+                                        index = this.availableMetricPoints.Dequeue();
+                                    }
+                                    else
                                     {
                                         // No MetricPoint is available for reuse
                                         return -1;
@@ -511,7 +529,7 @@ namespace OpenTelemetry.Metrics
                                 else
                                 {
                                     index = ++this.metricPointIndex;
-                                    if (index >= this.metricPointReclamationThreshold)
+                                    if (index == this.metricPointReclamationThreshold)
                                     {
                                         this.reclaimMetricPoints = true;
                                     }
@@ -552,7 +570,11 @@ namespace OpenTelemetry.Metrics
                             if (this.reclaimMetricPoints)
                             {
                                 // Check for an available MetricPoint
-                                if (!this.availableMetricPoints.TryDequeue(out index))
+                                if (this.availableMetricPoints.Count > 0)
+                                {
+                                    index = this.availableMetricPoints.Dequeue();
+                                }
+                                else
                                 {
                                     // No MetricPoint is available for reuse
                                     return -1;
@@ -561,7 +583,7 @@ namespace OpenTelemetry.Metrics
                             else
                             {
                                 index = ++this.metricPointIndex;
-                                if (index >= this.metricPointReclamationThreshold)
+                                if (index == this.metricPointReclamationThreshold)
                                 {
                                     this.reclaimMetricPoints = true;
                                 }
@@ -625,7 +647,11 @@ namespace OpenTelemetry.Metrics
                     !this.tagsToMetricPointIndexDictionaryDelta.TryGetValue(sortedTags, out lookupData))
                 {
                     // Check for an available MetricPoint
-                    if (!this.availableMetricPoints.TryDequeue(out index))
+                    if (this.availableMetricPoints.Count > 0)
+                    {
+                        index = this.availableMetricPoints.Dequeue();
+                    }
+                    else
                     {
                         // No MetricPoint is available for reuse
                         return false;
@@ -651,7 +677,11 @@ namespace OpenTelemetry.Metrics
                 if (!this.tagsToMetricPointIndexDictionaryDelta.TryGetValue(givenTags, out lookupData))
                 {
                     // Check for an available MetricPoint
-                    if (!this.availableMetricPoints.TryDequeue(out index))
+                    if (this.availableMetricPoints.Count > 0)
+                    {
+                        index = this.availableMetricPoints.Dequeue();
+                    }
+                    else
                     {
                         // No MetricPoint is available for reuse
                         return false;
@@ -761,6 +791,7 @@ namespace OpenTelemetry.Metrics
                         OpenTelemetrySdkEventSource.Log.MeasurementDropped(this.name, this.metricPointCapHitMessage, MetricPointCapHitFixMessage);
                     }
 
+                    Interlocked.Increment(ref this.DroppedMeasurements);
                     return;
                 }
 
@@ -777,6 +808,7 @@ namespace OpenTelemetry.Metrics
             }
             catch (Exception)
             {
+                Interlocked.Increment(ref this.DroppedMeasurements);
                 OpenTelemetrySdkEventSource.Log.MeasurementDropped(this.name, "SDK internal error occurred.", "Contact SDK owners.");
             }
         }
@@ -793,6 +825,7 @@ namespace OpenTelemetry.Metrics
                         OpenTelemetrySdkEventSource.Log.MeasurementDropped(this.name, this.metricPointCapHitMessage, MetricPointCapHitFixMessage);
                     }
 
+                    Interlocked.Increment(ref this.DroppedMeasurements);
                     return;
                 }
 
@@ -809,6 +842,7 @@ namespace OpenTelemetry.Metrics
             }
             catch (Exception)
             {
+                Interlocked.Increment(ref this.DroppedMeasurements);
                 OpenTelemetrySdkEventSource.Log.MeasurementDropped(this.name, "SDK internal error occurred.", "Contact SDK owners.");
             }
         }
@@ -825,6 +859,7 @@ namespace OpenTelemetry.Metrics
                         OpenTelemetrySdkEventSource.Log.MeasurementDropped(this.name, this.metricPointCapHitMessage, MetricPointCapHitFixMessage);
                     }
 
+                    Interlocked.Increment(ref this.DroppedMeasurements);
                     return;
                 }
 
@@ -841,6 +876,7 @@ namespace OpenTelemetry.Metrics
             }
             catch (Exception)
             {
+                Interlocked.Increment(ref this.DroppedMeasurements);
                 OpenTelemetrySdkEventSource.Log.MeasurementDropped(this.name, "SDK internal error occurred.", "Contact SDK owners.");
             }
         }
@@ -857,6 +893,7 @@ namespace OpenTelemetry.Metrics
                         OpenTelemetrySdkEventSource.Log.MeasurementDropped(this.name, this.metricPointCapHitMessage, MetricPointCapHitFixMessage);
                     }
 
+                    Interlocked.Increment(ref this.DroppedMeasurements);
                     return;
                 }
 
@@ -873,6 +910,7 @@ namespace OpenTelemetry.Metrics
             }
             catch (Exception)
             {
+                Interlocked.Increment(ref this.DroppedMeasurements);
                 OpenTelemetrySdkEventSource.Log.MeasurementDropped(this.name, "SDK internal error occurred.", "Contact SDK owners.");
             }
         }
